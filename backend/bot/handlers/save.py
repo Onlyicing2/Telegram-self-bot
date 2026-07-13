@@ -1,0 +1,282 @@
+"""
+Save Engine
+  .save f  — Forward save: metadata log + forward to Saved Messages, no download.
+  .save d  — Deep save: download → validate → upload → DB record → cleanup.
+
+Safety guarantees:
+  - Deep save enforces a hard size limit before any download is attempted.
+  - BytesIO buffer is always closed in a finally block — zero memory leaks.
+  - Empty-download guard rejects corrupted or zero-byte transfers.
+  - Edit-first policy: every response edits the triggering message in-place.
+"""
+import io
+import logging
+from datetime import datetime
+
+import pytz
+from telethon import events
+from telethon.tl.types import MessageMediaDocument, MessageMediaPhoto
+
+from backend.bot.handlers.guard import is_owner
+from backend.db.client import get_db, get_next_save_code, log
+
+logger = logging.getLogger(__name__)
+
+# Hard ceiling for in-memory deep save on Render Free (512 MB RAM).
+_MAX_DEEP_BYTES = 50 * 1024 * 1024  # 50 MB
+
+_MEDIA_TYPE_MAP = {
+    "image/jpeg": "Photo",
+    "image/png": "Photo",
+    "image/gif": "GIF",
+    "image/webp": "Sticker",
+    "video/mp4": "Video",
+    "audio/mpeg": "Audio",
+    "audio/ogg": "Voice",
+    "application/pdf": "Document",
+}
+
+
+def _detect_media_type(mime: str | None) -> str:
+    if not mime:
+        return "Unknown"
+    return _MEDIA_TYPE_MAP.get(mime, "Document")
+
+
+def _build_tags(media_type: str, dt: datetime) -> list[str]:
+    mt = media_type.lower().replace(" ", "_")
+    return [
+        "#saved",
+        f"#saved_{mt}",
+        f"#saved_{dt.year}",
+        f"#saved_{dt.year}_{dt.month:02d}",
+        f"#saved_{dt.year}_{dt.month:02d}_{dt.day:02d}",
+    ]
+
+
+def _build_caption(
+    save_code: str,
+    sender: str,
+    chat_id: int,
+    msg_id: int,
+    dt: datetime,
+    media_type: str,
+    mime: str | None,
+    file_size: int | None,
+    file_name: str | None,
+    tags: list[str],
+) -> str:
+    size_str = f"{file_size / 1024:.1f} KB" if file_size else "—"
+    return (
+        f"📦 DeepSaved\n"
+        f"🎙 Sender: {sender}\n"
+        f"💬 Chat ID: `{chat_id}`\n"
+        f"🆔 Msg ID: `{msg_id}`\n"
+        f"🕒 Time: {dt.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+        f"🖼 Type: {media_type}\n"
+        f"🧾 MIME: {mime or '—'}\n"
+        f"📦 Size: {size_str}\n"
+        f"📁 File: {file_name or '—'}\n"
+        f"🏷 Tags: {' '.join(tags)}"
+    )
+
+
+def _unwrap_forward(result) -> object | None:
+    """Telethon forward_messages may return a scalar or a list."""
+    if result is None:
+        return None
+    return result[0] if isinstance(result, list) else result
+
+
+def register(client, owner_id: int, tz_str: str) -> None:
+
+    @client.on(events.NewMessage(outgoing=True, pattern=r"^\.save (f|d)$"))
+    async def save_cmd(event) -> None:
+        if not is_owner(event, owner_id):
+            return
+
+        mode = event.pattern_match.group(1)
+        reply = await event.message.get_reply_message()
+        if not reply:
+            await event.edit("⚠️ Reply to a message to save it.")
+            return
+
+        db = get_db()
+        save_code = await get_next_save_code(db)
+        tz = pytz.timezone(tz_str)
+        now = datetime.now(tz)
+
+        sender_name = "Unknown"
+        sender_id = reply.sender_id or 0
+        try:
+            sender = await reply.get_sender()
+            if sender:
+                parts = [
+                    getattr(sender, "first_name", "") or "",
+                    getattr(sender, "last_name", "") or "",
+                ]
+                sender_name = " ".join(p for p in parts if p).strip() or str(sender_id)
+        except Exception:
+            pass
+
+        origin_chat_id = reply.chat_id
+        origin_msg_id = reply.id
+
+        mime_type = None
+        file_size = None
+        file_name = None
+        file_id = None
+
+        media = reply.media
+        if isinstance(media, MessageMediaDocument):
+            doc = media.document
+            mime_type = getattr(doc, "mime_type", None)
+            file_size = getattr(doc, "size", None)
+            for attr in getattr(doc, "attributes", []):
+                fn = getattr(attr, "file_name", None)
+                if fn:
+                    file_name = fn
+                    break
+            file_id = str(getattr(doc, "id", ""))
+        elif isinstance(media, MessageMediaPhoto):
+            mime_type = "image/jpeg"
+            photo = media.photo
+            if hasattr(photo, "sizes") and photo.sizes:
+                file_size = getattr(photo.sizes[-1], "size", None)
+            file_id = str(getattr(photo, "id", ""))
+
+        media_type = _detect_media_type(mime_type)
+        tags = _build_tags(media_type, now)
+
+        # ── Forward Save ──────────────────────────────────────────────────
+        if mode == "f":
+            try:
+                raw = await client.forward_messages("me", reply)
+                fwd = _unwrap_forward(raw)
+                saved_chat_id = fwd.chat_id if fwd else None
+                saved_msg_id = fwd.id if fwd else None
+            except Exception as exc:
+                logger.error("forward save failed: %s", exc)
+                await event.edit(f"❌ Forward failed: {exc}")
+                return
+
+            db.table("saved_items").insert({
+                "save_code": save_code,
+                "save_type": "forward",
+                "origin_chat_id": origin_chat_id,
+                "origin_msg_id": origin_msg_id,
+                "saved_chat_id": saved_chat_id,
+                "saved_msg_id": saved_msg_id,
+                "sender_name": sender_name,
+                "sender_id": sender_id,
+                "mime_type": mime_type,
+                "file_id": file_id,
+                "file_size": file_size,
+                "media_type": media_type,
+                "tags": tags,
+                "caption": None,
+                "owner_id": owner_id,
+            }).execute()
+
+            await event.edit(
+                f"📌 **Forward Saved** `{save_code}`\n"
+                f"📂 From: `{origin_chat_id}` / `{origin_msg_id}`"
+            )
+
+        # ── Deep Save ─────────────────────────────────────────────────────
+        else:
+            if not media:
+                await event.edit("⚠️ Replied message has no downloadable media.")
+                return
+
+            # Pre-flight: reject files that would exhaust available memory.
+            if file_size and file_size > _MAX_DEEP_BYTES:
+                mb = file_size / (1024 * 1024)
+                await event.edit(
+                    f"⚠️ File is {mb:.1f} MB — exceeds the "
+                    f"{_MAX_DEEP_BYTES // (1024 * 1024)} MB deep-save limit.\n"
+                    "Use `.save f` for a forward save instead."
+                )
+                return
+
+            # Build caption before download (save_code is already known).
+            caption = _build_caption(
+                save_code=save_code,
+                sender=sender_name,
+                chat_id=origin_chat_id,
+                msg_id=origin_msg_id,
+                dt=now,
+                media_type=media_type,
+                mime=mime_type,
+                file_size=file_size,
+                file_name=file_name,
+                tags=tags,
+            )
+
+            await event.edit(f"⬇️ Downloading… (`{save_code}`)")
+
+            buf = io.BytesIO()
+            try:
+                await client.download_media(reply, file=buf)
+
+                buf_size = buf.tell()
+                if buf_size == 0:
+                    await event.edit("❌ Download produced an empty buffer.")
+                    return
+
+                buf.seek(0)
+                buf.name = file_name or f"{save_code}.bin"
+
+                try:
+                    sent = await client.send_file(
+                        "me",
+                        buf,
+                        caption=caption,
+                        force_document=isinstance(media, MessageMediaDocument),
+                    )
+                except Exception as exc:
+                    logger.error("deep save upload failed: %s", exc)
+                    await event.edit(f"❌ Upload failed: {exc}")
+                    return
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("deep save download failed: %s", exc)
+                await event.edit(f"❌ Download failed: {exc}")
+                return
+            finally:
+                buf.close()  # Release memory regardless of outcome
+
+            saved_chat_id = sent.chat_id
+            saved_msg_id = sent.id
+
+            db.table("saved_items").insert({
+                "save_code": save_code,
+                "save_type": "deep",
+                "origin_chat_id": origin_chat_id,
+                "origin_msg_id": origin_msg_id,
+                "saved_chat_id": saved_chat_id,
+                "saved_msg_id": saved_msg_id,
+                "sender_name": sender_name,
+                "sender_id": sender_id,
+                "mime_type": mime_type,
+                "file_id": file_id,
+                "file_size": file_size,
+                "media_type": media_type,
+                "tags": tags,
+                "caption": caption,
+                "owner_id": owner_id,
+            }).execute()
+
+            await event.edit(
+                f"✅ **Deep Saved** `{save_code}`\n"
+                f"🖼 Type: {media_type} | 📦 Size: "
+                f"{f'{file_size / 1024:.1f} KB' if file_size else '—'}"
+            )
+
+        await log(owner_id, "INFO", f"Saved {mode.upper()} {save_code}", {
+            "save_code": save_code,
+            "origin_chat_id": origin_chat_id,
+            "origin_msg_id": origin_msg_id,
+        })

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: lifeos-bot
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: >
+      pip install -r backend/requirements.txt &&
+      npm ci &&
+      npm run build
+    startCommand: python -m backend.main
+    envVars:
+      - key: PORT
+        generateValue: false
+      - key: TZ
+        value: Asia/Tehran
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: SESSION_STRING
+        sync: false
+      - key: BOT_OWNER_ID
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+    autoDeploy: true
