@@ -74,7 +74,7 @@ async def _cron_loop(client, owner_id: int, tz_str: str) -> None:
                 tz_str,
             )
 
-            if new_bio == state.get("last_bio", ""):
+            if new_bio == (state.get("last_bio") or ""):
                 continue
 
             try:
